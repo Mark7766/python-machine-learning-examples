@@ -1,0 +1,428 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from typing import List, Dict, Tuple
+import streamlit as st
+import os
+import joblib
+from datetime import datetime
+import traceback
+
+# 定义 DeepAR 模型
+class DeepAR(nn.Module):
+    def __init__(self, num_covariates: int, num_categories: int, embedding_dim: int, hidden_size: int, num_layers: int):
+        super(DeepAR, self).__init__()
+        self.embedding = nn.Embedding(num_categories, embedding_dim)
+        self.lstm = nn.LSTM(1 + num_covariates + embedding_dim, hidden_size, num_layers, batch_first=True)
+        self.mu_linear = nn.Linear(hidden_size, 1)
+        self.sigma_linear = nn.Linear(hidden_size, 1)
+
+    def forward(self, past_target: torch.Tensor, past_covariates: torch.Tensor, category: torch.Tensor,
+                future_covariates: torch.Tensor = None, prediction_length: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 调试：打印张量形状
+        print(f"past_target shape: {past_target.shape}")
+        print(f"past_covariates shape: {past_covariates.shape}")
+        print(f"category shape: {category.shape}")
+        if future_covariates is not None:
+            print(f"future_covariates shape: {future_covariates.shape}")
+
+        # 确保 category 是一维的 (batch_size,)
+        if category.dim() > 1:
+            category = category.squeeze()
+            if category.dim() > 1:
+                raise ValueError(f"Category tensor must be 1D, got shape {category.shape}")
+
+        # 确保 past_target 有有效的时间维度
+        if past_target.size(1) == 0:
+            raise ValueError("past_target time dimension is 0, check context_length and input data")
+
+        # 计算嵌入
+        embed = self.embedding(category)  # 形状：(batch_size, embedding_dim)
+        embed = embed.unsqueeze(1).repeat(1, past_target.size(1), 1)  # 形状：(batch_size, context_length, embedding_dim)
+        print(f"embed shape: {embed.shape}")  # 调试：打印 embed 形状
+
+        # 检查 embed 时间维度是否与 past_target 匹配
+        if embed.size(1) != past_target.size(1):
+            raise ValueError(f"Embed time dimension {embed.size(1)} does not match past_target time dimension {past_target.size(1)}")
+
+        inputs = torch.cat([past_target.unsqueeze(-1), past_covariates, embed], dim=-1)  # 形状：(batch_size, context_length, 1 + num_covariates + embedding_dim)
+        print(f"inputs shape: {inputs.shape}")  # 调试：打印 inputs 形状
+
+        lstm_out, (h, c) = self.lstm(inputs)
+
+        mu = self.mu_linear(lstm_out[:, -1, :])
+        sigma = F.softplus(self.sigma_linear(lstm_out[:, -1, :]))
+
+        if prediction_length > 0:
+            predictions_mu = []
+            predictions_sigma = []
+            current_target = past_target[:, -1]
+            current_h, current_c = h, c
+            for t in range(prediction_length):
+                embed_t = self.embedding(category).unsqueeze(1)  # 形状：(batch_size, 1, embedding_dim)
+                # 确保 future_covariates 是 3 维
+                if future_covariates.dim() != 3:
+                    raise ValueError(f"future_covariates must be 3D, got shape {future_covariates.shape}")
+                future_cov_t = future_covariates[:, t:t + 1, :]  # 形状：(batch_size, 1, num_covariates)
+                input_t = torch.cat(
+                    [current_target.unsqueeze(-1).unsqueeze(1), future_cov_t, embed_t], dim=-1)
+                print(f"input_t shape: {input_t.shape}")  # 调试：打印 input_t 形状
+                lstm_out_t, (current_h, current_c) = self.lstm(input_t, (current_h, current_c))
+                mu_t = self.mu_linear(lstm_out_t[:, -1, :])
+                sigma_t = F.softplus(self.sigma_linear(lstm_out_t[:, -1, :]))
+                predictions_mu.append(mu_t)
+                predictions_sigma.append(sigma_t)
+                current_target = mu_t.detach().squeeze(1)  # 修复维度问题，确保 current_target 为 (batch_size,)
+            return torch.cat(predictions_mu, dim=1), torch.cat(predictions_sigma, dim=1)
+        else:
+            mus = self.mu_linear(lstm_out)
+            sigmas = F.softplus(self.sigma_linear(lstm_out))
+            return mus.squeeze(-1), sigmas.squeeze(-1)
+
+
+# 高斯似然损失函数
+def gaussian_likelihood_loss(mu: torch.Tensor, sigma: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    dist = torch.distributions.Normal(mu, sigma)
+    return -dist.log_prob(target).mean()
+
+
+# 时间序列数据集
+class TimeSeriesDataset(Dataset):
+    def __init__(self, series_list: List[Dict], context_length: int, prediction_length: int):
+        self.series_list = series_list
+        self.context_length = context_length
+        self.prediction_length = prediction_length
+
+    def __len__(self):
+        return len(self.series_list) * 10
+
+    def __getitem__(self, idx):
+        series_idx = idx % len(self.series_list)
+        series = self.series_list[series_idx]
+        start_idx = np.random.randint(0, len(series['target']) - self.context_length - self.prediction_length)
+        past_target = torch.tensor(series['target'][start_idx:start_idx + self.context_length], dtype=torch.float32)
+        future_target = torch.tensor(
+            series['target'][start_idx + self.context_length:start_idx + self.context_length + self.prediction_length],
+            dtype=torch.float32)
+        past_covariates = torch.tensor(series['covariates'][start_idx:start_idx + self.context_length],
+                                       dtype=torch.float32)
+        future_covariates = torch.tensor(series['covariates'][
+                                         start_idx + self.context_length:start_idx + self.context_length + self.prediction_length],
+                                         dtype=torch.float32)
+        category = torch.tensor(series['category'], dtype=torch.long)  # 标量张量
+
+        # 调试：打印形状
+        print(f"Dataset item {idx}:")
+        print(f"  past_target shape: {past_target.shape}")
+        print(f"  future_target shape: {future_target.shape}")
+        print(f"  past_covariates shape: {past_covariates.shape}")
+        print(f"  future_covariates shape: {future_covariates.shape}")
+        print(f"  category shape: {category.shape}")
+
+        return past_target, past_covariates, category, future_target, future_covariates
+
+
+# 数据准备函数
+def prepare_data(df: pd.DataFrame, target_col: str = 'usage', group_cols: List[str] = ['factory', 'medium'],
+                 covariate_cols: List[str] = None, date_col: str = 'date') -> Tuple[
+    List[Dict], LabelEncoder, StandardScaler, StandardScaler]:
+    try:
+        # 验证所需列
+        required_cols = [target_col, date_col] + group_cols
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"缺少所需列：{missing_cols}")
+
+        # 确保 group_cols 中没有 NaN
+        if df[group_cols].isna().any().any():
+            raise ValueError(f"分组列 {group_cols} 中存在 NaN 值")
+
+        # 将 group_cols 转换为 Python 原生字符串
+        df = df.copy()
+        for col in group_cols:
+            df[col] = df[col].apply(lambda x: str(x[0]) if isinstance(x, (np.ndarray, list)) and len(x) > 0 else str(x))
+            invalid_types = df[col].apply(lambda x: isinstance(x, (list, dict, np.ndarray)))
+            if invalid_types.any():
+                invalid_values = df[col][invalid_types].unique()
+                raise ValueError(f"列 {col} 包含不可哈希的类型：{invalid_values}")
+
+        # 调试：打印 group_cols 的唯一值和类型
+        for col in group_cols:
+            print(f"{col} 的唯一值：{df[col].unique()}")
+            print(f"{col} 的类型：{df[col].apply(type).unique()}")
+
+        # 创建分组字符串（用 '_' 连接）
+        group_strings = ['_'.join(str(x) for x in row) for row in df[group_cols].values]
+        print("分组字符串样本：", group_strings[:5])
+        print("唯一分组字符串：", list(set(group_strings)))
+
+        # 确保日期列为 datetime 类型
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        if df[date_col].isna().any():
+            raise ValueError("日期列中存在无效或缺失的日期")
+
+        if covariate_cols is None:
+            covariate_cols = [col for col in df.columns if col not in [target_col, date_col] + group_cols]
+
+        df = df.sort_values(by=[*group_cols, date_col])
+
+        group_encoder = LabelEncoder()
+        df['category'] = group_encoder.fit_transform(group_strings)
+
+        target_scaler = StandardScaler()
+        cov_scaler = StandardScaler()
+
+        series_list = []
+        for cat, group_df in df.groupby('category'):
+            targets = target_scaler.fit_transform(group_df[target_col].values.reshape(-1, 1)).flatten()
+            covariates = cov_scaler.fit_transform(group_df[covariate_cols].values)
+            series_list.append({
+                'target': targets,
+                'covariates': covariates,
+                'category': cat,
+                'dates': group_df[date_col].values,
+                'group': group_df[group_cols].iloc[0].to_dict()
+            })
+
+        return series_list, group_encoder, target_scaler, cov_scaler
+    except Exception as e:
+        print("数据准备过程中出错：")
+        print(traceback.format_exc())
+        raise
+
+
+# 训练函数
+def train_model(df: pd.DataFrame, context_length: int = 12, prediction_length: int = 12,
+                hidden_size: int = 64, num_layers: int = 2, embedding_dim: int = 10,
+                epochs: int = 50, batch_size: int = 32, lr: float = 0.001) -> Tuple[
+    DeepAR, LabelEncoder, StandardScaler, StandardScaler]:
+    try:
+        series_list, group_encoder, target_scaler, cov_scaler = prepare_data(df)
+        num_categories = len(group_encoder.classes_)
+        num_covariates = series_list[0]['covariates'].shape[1]
+
+        dataset = TimeSeriesDataset(series_list, context_length, prediction_length)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        model = DeepAR(num_covariates, num_categories, embedding_dim, hidden_size, num_layers)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+
+        for epoch in range(epochs):
+            model.train()
+            total_loss = 0
+            for batch_idx, (past_target, past_cov, cat, future_target, future_cov) in enumerate(dataloader):
+                # 调试：打印批次形状
+                print(f"Batch {batch_idx}:")
+                print(f"  past_target shape: {past_target.shape}")
+                print(f"  past_cov shape: {past_cov.shape}")
+                print(f"  cat shape: {cat.shape}")
+                print(f"  future_target shape: {future_target.shape}")
+                print(f"  future_cov shape: {future_cov.shape}")
+
+                optimizer.zero_grad()
+                full_target = torch.cat([past_target, future_target], dim=1)
+                full_cov = torch.cat([past_cov, future_cov], dim=1)
+
+                # 确保时间维度有效
+                if full_target.size(1) <= prediction_length:
+                    raise ValueError(f"时间维度太短：{full_target.size(1)}，期望 > {prediction_length}")
+
+                mu, sigma = model(full_target[:, :-prediction_length], full_cov[:, :-prediction_length], cat)
+                mu_dec, sigma_dec = mu[:, -prediction_length:], sigma[:, -prediction_length:]
+                loss = gaussian_likelihood_loss(mu_dec, sigma_dec, future_target)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss / len(dataloader)}")
+
+        torch.save(model.state_dict(), 'model.pth')
+        joblib.dump(group_encoder, 'group_encoder.pkl')
+        joblib.dump(target_scaler, 'target_scaler.pkl')
+        joblib.dump(cov_scaler, 'cov_scaler.pkl')
+        joblib.dump(series_list, 'series_list.pkl')  # 保存 series_list 用于预测
+
+        return model, group_encoder, target_scaler, cov_scaler
+    except Exception as e:
+        print("训练过程中出错：")
+        print(traceback.format_exc())
+        raise
+
+
+# 预测函数
+def predict(model: DeepAR, future_df: pd.DataFrame, group_encoder: LabelEncoder, target_scaler: StandardScaler,
+            cov_scaler: StandardScaler, context_length: int = 12, prediction_length: int = 12) -> pd.DataFrame:
+    try:
+        model.eval()
+        future_df['date'] = pd.to_datetime(future_df['date'], errors='coerce')
+        if future_df['date'].isna().any():
+            raise ValueError("未来计划中的日期无效")
+        future_df = future_df.sort_values(by=['factory', 'medium', 'date'])
+        future_strings = ['_'.join(str(x) for x in row) for row in future_df[['factory', 'medium']].values]
+
+        # 验证分组字符串
+        if not all(fs in group_encoder.classes_ for fs in set(future_strings)):
+            raise ValueError("未来计划包含训练数据中未见的分组")
+
+        future_df['category'] = group_encoder.transform(future_strings)
+
+        # 从训练数据加载 series_list 以获取历史上下文
+        if not os.path.exists('series_list.pkl'):
+            raise FileNotFoundError("未找到 series_list.pkl，请先训练模型")
+        series_list = joblib.load('series_list.pkl')
+
+        predictions = []
+        with torch.no_grad():
+            for cat, group in future_df.groupby('category'):
+                # 查找对应的训练数据系列
+                series = next((s for s in series_list if s['category'] == cat), None)
+                if series is None:
+                    raise ValueError(f"未找到类别 {cat} 的历史数据")
+
+                # 使用最后 context_length 个时间点的历史数据
+                past_target = torch.tensor(series['target'][-context_length:], dtype=torch.float32)
+                past_cov = torch.tensor(series['covariates'][-context_length:], dtype=torch.float32)
+                category = torch.tensor([cat], dtype=torch.long)
+
+                # 准备未来协变量
+                future_cov = torch.tensor(
+                    cov_scaler.transform(group.drop(columns=['date', 'factory', 'medium', 'category']).values),
+                    dtype=torch.float32)
+                if future_cov.dim() == 2:  # (prediction_length, num_covariates)
+                    future_cov = future_cov.unsqueeze(0)  # (1, prediction_length, num_covariates)
+
+                # 调试：打印形状
+                print(f"预测类别 {cat}:")
+                print(f"  past_target shape: {past_target.shape}")
+                print(f"  past_cov shape: {past_cov.shape}")
+                print(f"  category shape: {category.shape}")
+                print(f"  future_cov shape: {future_cov.shape}")
+
+                mu, sigma = model(past_target.unsqueeze(0), past_cov.unsqueeze(0), category,
+                                  future_cov, prediction_length)  # 移除额外的 unsqueeze(0)
+                pred_usage = target_scaler.inverse_transform(mu.numpy()).flatten()
+
+                for i, usage in enumerate(pred_usage):
+                    predictions.append({
+                        'factory': group['factory'].iloc[0],
+                        'medium': group['medium'].iloc[0],
+                        'date': group['date'].iloc[i],
+                        'predicted_usage': usage
+                    })
+
+        return pd.DataFrame(predictions)
+    except Exception as e:
+        print("预测过程中出错：")
+        print(traceback.format_exc())
+        raise
+
+
+# 生成测试数据
+def generate_test_data(num_factories=2, num_media=2, num_products=3, num_months=36, future_months=12):
+    try:
+        factories = [f'Factory_{i}' for i in range(1, num_factories + 1)]
+        media = [f'Medium_{i}' for i in range(1, num_media + 1)]
+        products = [f'Product_{i}' for i in range(1, num_products + 1)]
+        dates = pd.date_range(start='2020-01-01', periods=num_months, freq='ME')
+
+        data = []
+        for factory in factories:
+            for medium in media:
+                base_usage = np.random.uniform(1000, 5000)
+                trend = np.linspace(0, 100, num_months)
+                seasonality = 500 * np.sin(2 * np.pi * np.arange(num_months) / 12)
+                for t in range(num_months):
+                    prod_quantities = {prod: np.random.uniform(100, 1000) for prod in products}
+                    usage = base_usage + trend[t] + seasonality[t] + sum(prod_quantities.values()) * 0.1 + np.random.normal(
+                        0, 100)
+                    row = {'date': dates[t], 'factory': factory, 'medium': medium, 'usage': usage}
+                    row.update(prod_quantities)
+                    data.append(row)
+
+        hist_df = pd.DataFrame(data)
+        hist_df.to_csv('historical_data.csv', index=False)
+
+        future_dates = pd.date_range(start=dates[-1] + pd.DateOffset(months=1), periods=future_months, freq='ME')
+        future_data = []
+        for factory in factories:
+            for medium in media:
+                for t in range(future_months):
+                    prod_quantities = {prod: np.random.uniform(100, 1000) for prod in products}
+                    row = {'date': future_dates[t], 'factory': factory, 'medium': medium}
+                    row.update(prod_quantities)
+                    future_data.append(row)
+
+        future_df = pd.DataFrame(future_data)
+        future_df.to_csv('future_plan.csv', index=False)
+
+        return hist_df, future_df
+    except Exception as e:
+        print("生成测试数据出错：")
+        print(traceback.format_exc())
+        raise
+
+
+# Streamlit 界面
+def main():
+    st.title("能源预测产品")
+
+    tab1, tab2, tab3 = st.tabs(["生成测试数据", "训练模型", "预测"])
+
+    with tab1:
+        st.header("生成测试数据")
+        if st.button("���成数据"):
+            try:
+                hist_df, future_df = generate_test_data()
+                st.success("测��数据已生成：historical_data.csv 和 future_plan.csv")
+                st.download_button("下载历史数据", hist_df.to_csv(index=False), file_name="historical_data.csv")
+                st.download_button("下载未来计划", future_df.to_csv(index=False), file_name="future_plan.csv")
+            except Exception as e:
+                st.error(f"生成数据失败：{e}")
+                print("生成数据出错：")
+                print(traceback.format_exc())
+
+    with tab2:
+        st.header("训练模型")
+        uploaded_hist = st.file_uploader("上传历史数据 CSV", type="csv")
+        if uploaded_hist:
+            try:
+                df = pd.read_csv(uploaded_hist)
+                st.write("上传的数据预览：")
+                st.dataframe(df.head())
+                if st.button("训练"):
+                    with st.spinner("训练中..."):
+                        model, group_encoder, target_scaler, cov_scaler = train_model(df)
+                    st.success("模型训练并保存完成！")
+            except Exception as e:
+                st.error(f"训练失败：{e}")
+                print("训练出错：")
+                print(traceback.format_exc())
+
+    with tab3:
+        st.header("预测未来用量")
+        uploaded_future = st.file_uploader("上传未来计划 CSV", type="csv")
+        if uploaded_future and os.path.exists('model.pth') and os.path.exists('series_list.pkl'):
+            try:
+                future_df = pd.read_csv(uploaded_future)
+                if st.button("预测"):
+                    model = DeepAR(3, 4, 10, 64, 2)  # num_cov=3 (products), num_cat=4 (2fact*2med)
+                    model.load_state_dict(torch.load('model.pth'))
+                    group_encoder = joblib.load('group_encoder.pkl')
+                    target_scaler = joblib.load('target_scaler.pkl')
+                    cov_scaler = joblib.load('cov_scaler.pkl')
+                    with st.spinner("预测中..."):
+                        pred_df = predict(model, future_df, group_encoder, target_scaler, cov_scaler)
+                    st.dataframe(pred_df)
+                    st.download_button("下载预测结果", pred_df.to_csv(index=False), file_name="predictions.csv")
+            except Exception as e:
+                st.error(f"预测失败：{e}")
+                print("预测出错：")
+                print(traceback.format_exc())
+
+
+if __name__ == "__main__":
+    main()
