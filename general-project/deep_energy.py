@@ -13,13 +13,27 @@ import joblib
 from datetime import datetime
 import traceback
 
-# 定义 DeepAR 模型
+# ========================= DeepAR 模型结构说明 =========================
+# DeepAR 是一种基于 LSTM 的概率时间序列预测模型。
+# 主要结构：
+# - 输入：历史目标序列、协变量、分组类别嵌入。
+# - 嵌入层：将类别编码为向量。
+# - LSTM 层：处理拼接后的输入序列，学习时序特征。
+# - 输出层：分别预测每个时间步的均值 mu 和方差 sigma。
+# 训练时：输入历史和未来目标，预测未来 usage。
+# 推理时：自回归生成未来 usage，每步用上一步预测值作为输入。
+# 输出：未来 usage 的均值和方差，可用于生成分布或置信区间。
 class DeepAR(nn.Module):
     def __init__(self, num_covariates: int, num_categories: int, embedding_dim: int, hidden_size: int, num_layers: int):
+        # 初始化父类
         super(DeepAR, self).__init__()
+        # 类别嵌入层，将类别编码为 embedding 向量
         self.embedding = nn.Embedding(num_categories, embedding_dim)
+        # LSTM 层，输入为目标值+协变量+嵌入，输出为隐藏状态
         self.lstm = nn.LSTM(1 + num_covariates + embedding_dim, hidden_size, num_layers, batch_first=True)
+        # 输出均值的线性层
         self.mu_linear = nn.Linear(hidden_size, 1)
+        # 输出方差的线性层
         self.sigma_linear = nn.Linear(hidden_size, 1)
 
     def forward(self, past_target: torch.Tensor, past_covariates: torch.Tensor, category: torch.Tensor,
@@ -127,22 +141,27 @@ class TimeSeriesDataset(Dataset):
         return past_target, past_covariates, category, future_target, future_covariates
 
 
-# 数据准备函数
+# 数据准备函数：对原始数据进行分组、编码、归一化等预处理
+# df: 输入的原始 DataFrame
+# target_col: 目标变量列名，默认 'usage'
+# group_cols: 分组列名列表，默认 ['factory', 'medium']
+# covariate_cols: 协变量列名列表，默认 None（自动推断）
+# date_col: 日期列名，默认 'date'
 def prepare_data(df: pd.DataFrame, target_col: str = 'usage', group_cols: List[str] = ['factory', 'medium'],
                  covariate_cols: List[str] = None, date_col: str = 'date') -> Tuple[
     List[Dict], LabelEncoder, StandardScaler, StandardScaler]:
     try:
-        # 验证所需列
+        # 1. 检查输入数据是否包含所有必要的列
         required_cols = [target_col, date_col] + group_cols
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"缺少所需列：{missing_cols}")
 
-        # 确保 group_cols 中没有 NaN
+        # 2. 检查分组列是否有缺失值
         if df[group_cols].isna().any().any():
             raise ValueError(f"分组列 {group_cols} 中存在 NaN 值")
 
-        # 将 group_cols 转换为 Python 原生字符串
+        # 3. 将分组列转换为字符串，保证分组可哈希
         df = df.copy()
         for col in group_cols:
             df[col] = df[col].apply(lambda x: str(x[0]) if isinstance(x, (np.ndarray, list)) and len(x) > 0 else str(x))
@@ -151,44 +170,50 @@ def prepare_data(df: pd.DataFrame, target_col: str = 'usage', group_cols: List[s
                 invalid_values = df[col][invalid_types].unique()
                 raise ValueError(f"列 {col} 包含不可哈希的类型：{invalid_values}")
 
-        # 调试：打印 group_cols 的唯一值和类型
+        # 4. 打印分组列的唯��值和类型，便于调试
         for col in group_cols:
             print(f"{col} 的唯一值：{df[col].unique()}")
             print(f"{col} 的类型：{df[col].apply(type).unique()}")
 
-        # 创建分组字符串（用 '_' 连接）
+        # 5. 构造分组字符串（如 factory_medium），用于后续编码
         group_strings = ['_'.join(str(x) for x in row) for row in df[group_cols].values]
         print("分组字符串样本：", group_strings[:5])
         print("唯一分组字符串：", list(set(group_strings)))
 
-        # 确保日期列为 datetime 类型
+        # 6. 日期列转为 datetime 类型，保证时间顺序
         df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
         if df[date_col].isna().any():
             raise ValueError("日期列中存在无效或缺失的日期")
 
+        # 7. 自动推断协变量列（除目标、日期、分组外的列）
         if covariate_cols is None:
             covariate_cols = [col for col in df.columns if col not in [target_col, date_col] + group_cols]
 
+        # 8. 按分组和日期排序，保证时序一致
         df = df.sort_values(by=[*group_cols, date_col])
 
+        # 9. 用 LabelEncoder 对分组字符串编码为类别整数
         group_encoder = LabelEncoder()
         df['category'] = group_encoder.fit_transform(group_strings)
 
+        # 10. 用 StandardScaler 对目标变量和协变量归一化
         target_scaler = StandardScaler()
         cov_scaler = StandardScaler()
 
+        # 11. 按类别分组，生成每个序列的 target、covariates、category、dates、group 信息
         series_list = []
         for cat, group_df in df.groupby('category'):
             targets = target_scaler.fit_transform(group_df[target_col].values.reshape(-1, 1)).flatten()
             covariates = cov_scaler.fit_transform(group_df[covariate_cols].values)
             series_list.append({
-                'target': targets,
-                'covariates': covariates,
-                'category': cat,
-                'dates': group_df[date_col].values,
-                'group': group_df[group_cols].iloc[0].to_dict()
+                'target': targets,  # 归一化后的目标序列
+                'covariates': covariates,  # 归一化后的协变量序列
+                'category': cat,  # 分组类别编码
+                'dates': group_df[date_col].values,  # 时间序列
+                'group': group_df[group_cols].iloc[0].to_dict()  # 分组信息
             })
 
+        # 返回序列列表、分组编码器、目标归一化器、协变量归一化器
         return series_list, group_encoder, target_scaler, cov_scaler
     except Exception as e:
         print("数据准备过程中出错：")
@@ -196,56 +221,66 @@ def prepare_data(df: pd.DataFrame, target_col: str = 'usage', group_cols: List[s
         raise
 
 
-# 训练函数
+# 训练函数：用于训练 DeepAR 时间序列模型
+# df: 输入的原始 DataFrame
+# context_length: 历史窗口长度
+# prediction_length: 预测窗口长度
+# hidden_size: LSTM 隐藏层维度
+# num_layers: LSTM 层数
+# embedding_dim: 类别嵌入维度
+# epochs: 训练轮数
+# batch_size: 批次大小
+# lr: 学习率
 def train_model(df: pd.DataFrame, context_length: int = 12, prediction_length: int = 12,
                 hidden_size: int = 64, num_layers: int = 2, embedding_dim: int = 10,
                 epochs: int = 50, batch_size: int = 32, lr: float = 0.001) -> Tuple[
     DeepAR, LabelEncoder, StandardScaler, StandardScaler]:
     try:
+        # 1. 数据预处理，获取序列列表和编码器
         series_list, group_encoder, target_scaler, cov_scaler = prepare_data(df)
-        num_categories = len(group_encoder.classes_)
-        num_covariates = series_list[0]['covariates'].shape[1]
+        num_categories = len(group_encoder.classes_)  # 分组类别数
+        num_covariates = series_list[0]['covariates'].shape[1]  # 协变量数
 
+        # 2. 构建数据集和加载器
         dataset = TimeSeriesDataset(series_list, context_length, prediction_length)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+        # 3. 初始化模型和优化器
         model = DeepAR(num_covariates, num_categories, embedding_dim, hidden_size, num_layers)
         optimizer = optim.Adam(model.parameters(), lr=lr)
 
+        # 4. 训练循环
         for epoch in range(epochs):
-            model.train()
+            model.train()  # 设置为训练模式
             total_loss = 0
             for batch_idx, (past_target, past_cov, cat, future_target, future_cov) in enumerate(dataloader):
-                # 调试：打印批次形状
-                print(f"Batch {batch_idx}:")
-                print(f"  past_target shape: {past_target.shape}")
-                print(f"  past_cov shape: {past_cov.shape}")
-                print(f"  cat shape: {cat.shape}")
-                print(f"  future_target shape: {future_target.shape}")
-                print(f"  future_cov shape: {future_cov.shape}")
-
-                optimizer.zero_grad()
+                # 每个 batch 包含多个序列，分别为历史目标、协变量、类别、未来目标、未来协变量
+                optimizer.zero_grad()  # 梯度清零
+                # 拼接历史和未来目标、协变量，形成完整序列
                 full_target = torch.cat([past_target, future_target], dim=1)
                 full_cov = torch.cat([past_cov, future_cov], dim=1)
-
-                # 确保时间维度有效
+                # 检查时间维度
                 if full_target.size(1) <= prediction_length:
                     raise ValueError(f"时间维度太短：{full_target.size(1)}，期望 > {prediction_length}")
-
+                # 前向传播，预测未来 usage
                 mu, sigma = model(full_target[:, :-prediction_length], full_cov[:, :-prediction_length], cat)
+                # 取最后 prediction_length 个时间步的预测结果
                 mu_dec, sigma_dec = mu[:, -prediction_length:], sigma[:, -prediction_length:]
+                # 计算高斯似然损失
                 loss = gaussian_likelihood_loss(mu_dec, sigma_dec, future_target)
-                loss.backward()
-                optimizer.step()
+                loss.backward()  # 反向传播
+                optimizer.step()  # 参数更新
                 total_loss += loss.item()
             print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss / len(dataloader)}")
 
+        # 5. 保存模型和���处理器到本地文件
         torch.save(model.state_dict(), 'model.pth')
         joblib.dump(group_encoder, 'group_encoder.pkl')
         joblib.dump(target_scaler, 'target_scaler.pkl')
         joblib.dump(cov_scaler, 'cov_scaler.pkl')
         joblib.dump(series_list, 'series_list.pkl')  # 保存 series_list 用于预测
 
+        # 返回训练好的模型和预处理器
         return model, group_encoder, target_scaler, cov_scaler
     except Exception as e:
         print("训练过程中出错：")
@@ -370,14 +405,14 @@ def generate_test_data(num_factories=2, num_media=2, num_products=3, num_months=
 def main():
     st.title("能源预测产品")
 
-    tab1, tab2, tab3 = st.tabs(["生成测试数据", "训练模型", "预测"])
+    tab1, tab2, tab3 = st.tabs(["生成测试数据", "��练模型", "预测"])
 
     with tab1:
         st.header("生成测试数据")
-        if st.button("���成数据"):
+        if st.button("生成数据"):
             try:
                 hist_df, future_df = generate_test_data()
-                st.success("测��数据已生成：historical_data.csv 和 future_plan.csv")
+                st.success("测试数据已生成：historical_data.csv 和 future_plan.csv")
                 st.download_button("下载历史数据", hist_df.to_csv(index=False), file_name="historical_data.csv")
                 st.download_button("下载未来计划", future_df.to_csv(index=False), file_name="future_plan.csv")
             except Exception as e:
@@ -396,7 +431,7 @@ def main():
                 if st.button("训练"):
                     with st.spinner("训练中..."):
                         model, group_encoder, target_scaler, cov_scaler = train_model(df)
-                    st.success("模型训练并保存完成！")
+                    st.success("模型训练并保��完成！")
             except Exception as e:
                 st.error(f"训练失败：{e}")
                 print("训练出错：")
