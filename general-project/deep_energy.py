@@ -273,7 +273,7 @@ def train_model(df: pd.DataFrame, context_length: int = 12, prediction_length: i
                 total_loss += loss.item()
             print(f"Epoch {epoch + 1}/{epochs}, Loss: {total_loss / len(dataloader)}")
 
-        # 5. 保存模型和���处理器到本地文件
+        # 5. 保存模型和�����处理器到本地文件
         torch.save(model.state_dict(), 'model.pth')
         joblib.dump(group_encoder, 'group_encoder.pkl')
         joblib.dump(target_scaler, 'target_scaler.pkl')
@@ -288,59 +288,60 @@ def train_model(df: pd.DataFrame, context_length: int = 12, prediction_length: i
         raise
 
 
-# 预测函数
+# 预测函数：用于对未来计划数据进行推理预测
+# model: 已训练好的 DeepAR 模型
+# future_df: 未来计划的 DataFrame
+# group_encoder: 分组编码器
+# target_scaler: 目标归一化器
+# cov_scaler: 协变量归一化器
+# context_length: 历史窗口长度
+# prediction_length: 预测窗口长度
 def predict(model: DeepAR, future_df: pd.DataFrame, group_encoder: LabelEncoder, target_scaler: StandardScaler,
             cov_scaler: StandardScaler, context_length: int = 12, prediction_length: int = 12) -> pd.DataFrame:
     try:
-        model.eval()
+        model.eval()  # 设置为评估模式
+        # 1. 日期列转为 datetime 类型，保证时间顺序
         future_df['date'] = pd.to_datetime(future_df['date'], errors='coerce')
         if future_df['date'].isna().any():
             raise ValueError("未来计划中的日期无效")
+        # 2. 按分组和日期排序
         future_df = future_df.sort_values(by=['factory', 'medium', 'date'])
+        # 3. 构造分组字符串并编码
         future_strings = ['_'.join(str(x) for x in row) for row in future_df[['factory', 'medium']].values]
-
-        # 验证分组字符串
+        # 检查分组是否在训练集出现过
         if not all(fs in group_encoder.classes_ for fs in set(future_strings)):
             raise ValueError("未来计划包含训练数据中未见的分组")
-
         future_df['category'] = group_encoder.transform(future_strings)
 
-        # 从训练数据加载 series_list 以获取历史上下文
+        # 4. 加载训���时保存的 series_list，获取历史上下文
         if not os.path.exists('series_list.pkl'):
             raise FileNotFoundError("未找到 series_list.pkl，请先训练模型")
         series_list = joblib.load('series_list.pkl')
 
         predictions = []
         with torch.no_grad():
+            # 5. 按分组进行预测
             for cat, group in future_df.groupby('category'):
-                # 查找对应的训练数据系列
+                # 查找对应的训练数据系列，获取历史上下文
                 series = next((s for s in series_list if s['category'] == cat), None)
                 if series is None:
                     raise ValueError(f"未找到类别 {cat} 的历史数据")
-
-                # 使用最后 context_length 个时间点的历史数据
+                # 6. 提取最近 context_length 个历史目标和协变量
                 past_target = torch.tensor(series['target'][-context_length:], dtype=torch.float32)
                 past_cov = torch.tensor(series['covariates'][-context_length:], dtype=torch.float32)
                 category = torch.tensor([cat], dtype=torch.long)
-
-                # 准备未来协变量
+                # 7. 归一化未来协变量
                 future_cov = torch.tensor(
                     cov_scaler.transform(group.drop(columns=['date', 'factory', 'medium', 'category']).values),
                     dtype=torch.float32)
                 if future_cov.dim() == 2:  # (prediction_length, num_covariates)
                     future_cov = future_cov.unsqueeze(0)  # (1, prediction_length, num_covariates)
-
-                # 调试：打印形状
-                print(f"预测类别 {cat}:")
-                print(f"  past_target shape: {past_target.shape}")
-                print(f"  past_cov shape: {past_cov.shape}")
-                print(f"  category shape: {category.shape}")
-                print(f"  future_cov shape: {future_cov.shape}")
-
+                # 8. 调用模型进行多步预测
                 mu, sigma = model(past_target.unsqueeze(0), past_cov.unsqueeze(0), category,
-                                  future_cov, prediction_length)  # 移除额外的 unsqueeze(0)
+                                  future_cov, prediction_length)
+                # 9. 反归一化预测结果
                 pred_usage = target_scaler.inverse_transform(mu.numpy()).flatten()
-
+                # 10. 整理结果为 DataFrame
                 for i, usage in enumerate(pred_usage):
                     predictions.append({
                         'factory': group['factory'].iloc[0],
@@ -348,7 +349,6 @@ def predict(model: DeepAR, future_df: pd.DataFrame, group_encoder: LabelEncoder,
                         'date': group['date'].iloc[i],
                         'predicted_usage': usage
                     })
-
         return pd.DataFrame(predictions)
     except Exception as e:
         print("预测过程中出错：")
@@ -405,7 +405,7 @@ def generate_test_data(num_factories=2, num_media=2, num_products=3, num_months=
 def main():
     st.title("能源预测产品")
 
-    tab1, tab2, tab3 = st.tabs(["生成测试数据", "��练模型", "预测"])
+    tab1, tab2, tab3 = st.tabs(["生成测试数据", "����练模型", "预测"])
 
     with tab1:
         st.header("生成测试数据")
