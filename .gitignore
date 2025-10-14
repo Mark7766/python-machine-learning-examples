@@ -92,7 +92,12 @@ target/
 # IPython
 profile_default/
 ipython_config.py
-
+general-project/.idea/
+general-project/.dockerignore
+general-project/qwen.py
+general-project/.idea/vcs.xml
+iot_forecast_api/.idea/*
+general-project/.idea/vcs.xml
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:

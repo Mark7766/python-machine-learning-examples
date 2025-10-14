@@ -14,8 +14,8 @@ import os
 
 app = Flask(__name__)
 
-# 模型路径（替换为实际路径）
-MODEL_PATH = r"chronos-t5-large"
+# 模型路径（替换为实际路径）chronos-t5-large /work/gitspace/chronos-t5-tiny
+MODEL_PATH = r"C:/Git/work/gitspace/chronos-t5-tiny"
 
 # 全局加载模型（仅加载一次）
 pipeline = ChronosPipeline.from_pretrained(MODEL_PATH, local_files_only=True)
