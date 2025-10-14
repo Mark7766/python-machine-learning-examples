@@ -1,6 +1,5 @@
-# syntax=docker/dockerfile:1
 # 基于官方轻量级 Python 运行时（CPU）
-FROM python:3.10-slim AS runtime
+FROM python:3.13-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

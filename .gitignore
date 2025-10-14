@@ -5,7 +5,18 @@ __pycache__/
 */*/.idea
 # C extensions
 *.so
-
+chronos-t5-large/
+general-project/chronos-t5-large/config.json
+general-project/chronos-t5-large/generation_config.json
+general-project/chronos-t5-large/model.safetensors
+general-project/cov_scaler.pkl
+general-project/future_plan.csv
+general-project/group_encoder.pkl
+general-project/historical_data.csv
+general-project/model.pth
+general-project/requirements.txt
+general-project/series_list.pkl
+general-project/target_scaler.pkl
 # Distribution / packaging
 .Python
 build/
